@@ -386,3 +386,422 @@ Response (example):
 ## Versioning
 - 建议在 `meta.version` 中填充 skill 或 host 的版本号（例如 `0.1.0`）
 - manifest 变更需同步更新本文档对应的 Inputs/Outputs/Examples
+
+---
+
+## Best Practices & Patterns (最佳实践与范式)
+
+### 1. Agent 实现范式：LLM Function Calling
+
+#### 架构设计
+- **Agent Loop**：管理多轮对话和工具调用循环
+- **Tool Manager**：将 Skill Manifest 转换为 Function Calling Schema
+- **Validator**：使用 Pydantic 进行参数验证
+- **LLM Client**：支持多提供商（OpenAI、DashScope/Qwen）
+
+#### 核心流程
+```
+用户消息 → Agent Loop
+    ↓
+获取可用工具（Function Calling Schemas）
+    ↓
+调用 LLM（传入 messages + tools）
+    ↓
+LLM 返回 tool_calls（或最终答案）
+    ↓
+验证参数（Pydantic Schema）
+    ↓
+执行工具（直接调用 Runner）
+    ↓
+将结果反馈给 LLM
+    ↓
+LLM 生成最终回答
+```
+
+#### 关键实现点
+1. **工具发现**：从 `SkillRegistry` 获取所有 skills，转换为 Function Calling Schema
+2. **参数验证**：使用 Pydantic Schema 验证 LLM 返回的参数
+3. **错误反馈**：验证失败时，格式化错误信息反馈给 LLM，支持自动修正（最多 `max_validation_retries` 次）
+4. **会话管理**：支持多轮对话，通过 `conversation_id` 管理历史
+
+#### 代码示例
+```python
+# Agent Loop 核心逻辑
+for iteration in range(max_iterations):
+    llm_response = self.llm_client.chat(messages=messages, tools=tools)
+    
+    if llm_response.tool_calls:
+        for tool_call in llm_response.tool_calls:
+            # 验证参数
+            validation_result = self.validator.validate(tool_call)
+            if not validation_result.valid:
+                # 反馈错误给 LLM，让其修正
+                messages.append(Message(role="user", content=validation_result.error_message))
+                continue
+            
+            # 执行工具
+            tool_result = self.tool_manager.invoke_tool(...)
+            # 将结果添加到会话
+            messages.append(Message(role="tool", content=json.dumps(tool_result)))
+```
+
+---
+
+### 2. 死锁问题解决：避免同步 HTTP 调用
+
+#### 问题场景
+在 FastAPI 异步路由中，如果 Agent 使用同步 HTTP 调用 Skill Host（同一进程），会导致事件循环阻塞，形成死锁。
+
+#### 解决方案
+**直接调用 Runner，避免 HTTP 层**
+
+```python
+# ❌ 错误做法（会导致死锁）
+class ToolManager:
+    def invoke_tool(self, ...):
+        response = requests.post(f"{BASE_URL}/skills/{tool_name}:invoke", ...)
+        return response.json()
+
+# ✅ 正确做法（直接调用）
+class ToolManager:
+    def invoke_tool(self, ...):
+        factory = get_factory()
+        runner = factory.get_runner(manifest)
+        result = runner.invoke(...)  # 直接调用，不经过 HTTP
+        return result
+```
+
+#### 关键原则
+- **同一进程内**：Agent 和 Skill Host 在同一 FastAPI 应用中时，直接调用 Runner
+- **异步路由**：如果 Agent 的 `chat()` 是同步方法，使用 `ThreadPoolExecutor` 在线程池中执行
+- **分离部署**：如果 Agent 和 Skill Host 分离部署，使用异步 HTTP 客户端（如 `httpx`）
+
+#### 代码示例
+```python
+# FastAPI 路由中使用线程池
+@router.post("/agent/chat")
+async def chat(request: AgentRequest):
+    agent = get_agent()
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: agent.chat(request, trace_id=trace_id)
+        )
+    return response
+```
+
+---
+
+### 3. 参数验证与错误反馈范式
+
+#### Pydantic Schema 定义
+为每个 skill 定义对应的 Pydantic Schema：
+
+```python
+# src/agent/schemas/calculator.py
+class CalculatorInput(BaseModel):
+    numbers: List[float] = Field(..., description="List of numbers")
+    ops: List[str] = Field(..., description="Operations: mean, median, min, max")
+    compare: Optional[Dict[str, float]] = Field(None, description="Comparison values")
+```
+
+#### 验证与错误格式化
+```python
+class ToolCallValidator:
+    def validate(self, tool_call: ToolCall) -> ValidationResult:
+        schema_class = SKILL_INPUT_SCHEMAS.get(tool_call.name)
+        try:
+            validated_data = schema_class(**tool_call.arguments)
+            return ValidationResult(valid=True, corrected_arguments=validated_data.model_dump())
+        except ValidationError as e:
+            # 格式化错误信息，反馈给 LLM
+            error_message = self._format_validation_error(e, tool_call.name)
+            return ValidationResult(valid=False, error_message=error_message)
+```
+
+#### 错误反馈格式
+错误信息应该：
+- 明确指出哪些字段有问题
+- 说明期望的类型和格式
+- 提供修正建议
+- 使用 LLM 易于理解的语言
+
+---
+
+### 4. 日志与可观测性范式
+
+#### Trace ID 上下文传递
+使用 `ContextVar` 在异步上下文中传递 `trace_id`：
+
+```python
+# 定义上下文变量
+trace_id_ctx: ContextVar[str] = ContextVar("trace_id", default="")
+
+# 在请求开始时设置
+trace_id = x_trace_id or str(uuid.uuid4())
+trace_id_ctx.set(trace_id)
+
+# 在日志中使用
+logger.info("message", extra={"trace_id": trace_id_ctx.get()})
+```
+
+#### 日志格式化
+确保所有日志都包含 `trace_id`，即使在某些子进程中缺失：
+
+```python
+class TraceIDFormatter(logging.Formatter):
+    def format(self, record):
+        # 确保 trace_id 始终存在
+        if not hasattr(record, 'trace_id'):
+            record.trace_id = "-"
+        return super().format(record)
+```
+
+#### 关键日志字段
+- `trace_id`：追踪整个调用链路
+- `skill_id`：标识调用的 skill
+- `latency_ms`：执行耗时
+- `success`：是否成功
+- `error.code`、`error.message`：错误信息
+
+---
+
+### 5. 配置管理范式
+
+#### 多 LLM 提供商支持
+支持多个 LLM 提供商，通过配置切换：
+
+```python
+# 环境变量配置
+OPENAI_API_KEY=...
+OPENAI_API_BASE=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4
+
+DASHSCOPE_API_KEY=...
+DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_MODEL=qwen-plus
+```
+
+#### 配置加载优先级
+1. 环境变量
+2. `.env` 文件
+3. 默认值
+
+#### 配置验证
+在应用启动时验证必需的配置：
+
+```python
+def has_llm_config() -> bool:
+    """检查是否配置了至少一个 LLM 提供商"""
+    return bool(
+        config.openai_api_key or
+        config.dashscope_api_key or
+        config.anthropic_api_key
+    )
+```
+
+---
+
+### 6. Skill 调用流程（完整链路）
+
+#### 通过 Agent API 调用
+```
+用户请求 POST /agent/chat
+    ↓
+FastAPI 路由（异步）
+    ↓
+在线程池中执行 agent.chat()（同步方法）
+    ↓
+Agent Loop：
+    ├─ 获取工具列表（Function Calling Schemas）
+    ├─ 调用 LLM
+    ├─ 验证工具参数（Pydantic）
+    ├─ 执行工具（直接调用 Runner）
+    └─ 将结果反馈给 LLM
+    ↓
+Runner Factory 选择 Runner
+    ↓
+CLIPythonRunner 执行 Python 脚本
+    ├─ subprocess.run()
+    ├─ 通过 stdin 传入 JSON
+    └─ 从 stdout 读取 JSON 结果
+    ↓
+返回 NormalizedSkillResult
+    ↓
+Agent 生成最终回答
+    ↓
+返回 AgentResponse
+```
+
+#### 直接调用 Skill API
+```
+用户请求 POST /skills/{skill_id}:invoke
+    ↓
+FastAPI 路由（异步）
+    ↓
+Skill Registry 查找 manifest
+    ↓
+Runner Factory 选择 Runner
+    ↓
+Runner 执行 skill
+    ↓
+返回 NormalizedSkillResult
+```
+
+---
+
+### 7. 测试与调试范式
+
+#### Swagger UI 测试
+- 访问 `http://127.0.0.1:8000/docs`
+- 使用 "Try it out" 功能测试 API
+- 查看请求/响应格式和错误信息
+
+#### 测试脚本
+为每个 skill 创建测试脚本：
+- `test/test_api.sh`：基础 API 测试
+- `test/test_agent.sh`：Agent API 测试
+- `test/test_calculator.sh`：Calculator skill 测试
+
+#### 调试技巧
+1. **查看日志**：所有日志都包含 `trace_id`，可以追踪完整调用链
+2. **检查参数**：使用 Pydantic 验证确保参数格式正确
+3. **验证工具输出**：确保 skill 脚本只输出 JSON 格式
+4. **检查超时**：如果超时，检查 skill 脚本是否有死循环或长耗时操作
+
+---
+
+### 8. 错误处理范式
+
+#### 分层错误处理
+1. **Skill 层**：返回 `NormalizedSkillResult`，包含错误信息
+2. **Runner 层**：捕获异常，转换为 `NormalizedSkillResult`
+3. **Agent 层**：处理工具调用错误，反馈给 LLM
+4. **API 层**：捕获未处理异常，返回标准错误响应
+
+#### 错误代码规范
+- `INVALID_ARGUMENT`：参数错误
+- `NOT_FOUND`：资源未找到
+- `TIMEOUT`：超时
+- `FORBIDDEN_PATH`：路径不允许
+- `INTERNAL`：内部错误
+- `TOOL_INVOCATION_ERROR`：工具调用错误
+
+#### 错误信息格式
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "参数错误：numbers 字段是必需的",
+    "details": {
+      "field": "numbers",
+      "reason": "missing"
+    }
+  }
+}
+```
+
+---
+
+### 9. 性能优化范式
+
+#### 成本控制
+- **Token 限制**：`max_tokens` 限制每次请求的最大 token 数
+- **工具调用限制**：`max_tool_calls` 限制每次请求的最大工具调用次数
+- **超时控制**：`timeout_ms` 限制单个 skill 的执行时间
+
+#### 资源管理
+- **Runner 缓存**：RunnerFactory 缓存 Runner 实例，避免重复创建
+- **工具 Schema 缓存**：ToolManager 缓存工具 Schema，避免重复构建
+- **会话限制**：限制会话历史长度（如最多 20 条消息）
+
+---
+
+### 10. 扩展性设计范式
+
+#### 新增 Skill
+1. 创建 Python 脚本：`skill_cli/{skill_id}.py`
+2. 创建 Manifest：`skills/{skill_id}.yaml`
+3. 定义 Pydantic Schema：`src/agent/schemas/{skill_id}.py`
+4. 注册 Schema：在 `src/agent/schemas/__init__.py` 中注册
+5. 添加测试：创建 `test/test_{skill_id}.sh`
+
+#### 新增 Runner
+1. 实现 `SkillRunner` 接口
+2. 在 `RunnerFactory` 中注册（键为 `type:runtime`）
+3. 确保返回 `NormalizedSkillResult`
+
+#### 新增 LLM 提供商
+1. 实现 `LLMClient` 接口
+2. 在 `create_client()` 中注册
+3. 添加配置项（API key、base URL、model）
+
+---
+
+## 案例研究
+
+### 案例 1：Calculator Skill 实现
+
+**需求**：实现一个计算器 skill，支持统计计算（均值、中位数、最小值、最大值、求和）
+
+**实现步骤**：
+1. 创建 `skill_cli/calculator.py`，实现计算逻辑
+2. 创建 `skills/calculator.yaml` manifest
+3. 定义 `src/agent/schemas/calculator.py` Pydantic Schema
+4. 注册到 `SKILL_INPUT_SCHEMAS`
+5. 创建测试脚本 `test/test_calculator.sh`
+
+**关键点**：
+- 输入验证：确保 `numbers` 是数字列表，`ops` 是支持的操作
+- 错误处理：处理空列表、无效操作等边界情况
+- 输出格式：返回标准化的 `NormalizedSkillResult`
+
+### 案例 2：死锁问题解决
+
+**问题**：Agent 调用 Skill Host 时出现超时，最终发现是死锁问题
+
+**原因**：
+- Agent 和 Skill Host 在同一 FastAPI 应用中
+- Agent 使用同步 HTTP 调用 Skill Host
+- 阻塞了事件循环，导致 Skill Host 无法响应
+
+**解决方案**：
+- 修改 `ToolManager.invoke_tool()`，直接调用 Runner 而不是 HTTP
+- 在 FastAPI 路由中使用 `ThreadPoolExecutor` 执行同步的 `agent.chat()`
+
+**效果**：
+- 消除了死锁问题
+- 提高了性能（减少了 HTTP 开销）
+- 保持了代码的简洁性
+
+### 案例 3：参数验证与 LLM 自我修正
+
+**场景**：LLM 返回的工具参数格式不正确（如缺少必需字段、类型错误）
+
+**实现**：
+1. 使用 Pydantic Schema 验证参数
+2. 格式化错误信息，反馈给 LLM
+3. LLM 根据错误信息修正参数
+4. 最多重试 `max_validation_retries` 次
+
+**效果**：
+- 提高了工具调用的成功率
+- 减少了人工干预
+- 提升了用户体验
+
+---
+
+## 总结
+
+本 demo 实现了一个完整的 Agent 系统，核心特点：
+
+1. **LLM Function Calling**：完全依赖 LLM 的 Function Calling 能力，无需规则路由
+2. **参数验证**：使用 Pydantic 进行严格验证，支持 LLM 自我修正
+3. **直接调用**：Agent 直接调用 Runner，避免 HTTP 死锁
+4. **可观测性**：完整的 trace_id 追踪和日志记录
+5. **可扩展性**：支持新增 skill、runner、LLM 提供商
+6. **标准化**：统一的输入输出格式（NormalizedSkillResult）
+
+这些范式可以应用到其他类似的 Agent 系统中。
