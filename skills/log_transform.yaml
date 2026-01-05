@@ -1,0 +1,7 @@
+id: log_transform
+type: cli
+runtime: python
+entry: ./skill_cli/log_transform.py
+timeout_ms: 15000
+allowed_root: ./data
+

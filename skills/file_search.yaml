@@ -1,0 +1,7 @@
+id: file_search
+type: cli
+runtime: python
+entry: ./skill_cli/file_search.py
+timeout_ms: 15000
+allowed_root: ./data
+

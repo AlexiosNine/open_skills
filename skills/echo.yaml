@@ -1,0 +1,7 @@
+id: echo
+type: cli
+runtime: python
+entry: ./skill_cli/echo.py
+timeout_ms: 15000
+allowed_root: ./data
+

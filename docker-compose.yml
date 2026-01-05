@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  skill-host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openskill-host
+    ports:
+      - "8000:8000"
+    environment:
+      # Skill Host Configuration
+      - OPENSKILL_HTTP_BASE_URL=http://0.0.0.0:8000
+      - OPENSKILL_ALLOWED_ROOT=./data
+      - OPENSKILL_CLI_DIR=./skill_cli
+      - OPENSKILL_TIMEOUT_MS=15000
+      - OPENSKILL_DEBUG=0
+      
+      # LLM API Configuration (optional)
+      # Uncomment and set your API keys
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - OPENAI_MODEL=gpt-3.5-turbo
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      
+    volumes:
+      # Mount data directory for persistent storage
+      - ./data:/app/data
+      # Mount skill_cli for hot-reload (optional, for development)
+      - ./skill_cli:/app/skill_cli
+      # Mount skills for hot-reload (optional, for development)
+      - ./skills:/app/skills
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
