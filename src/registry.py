@@ -85,6 +85,11 @@ class SkillRegistry:
             # Ensure 'id' is set (default to filename without extension)
             if "id" not in data:
                 data["id"] = yaml_path.stem
+            
+            # Validate id format
+            import re
+            if not re.match(r"^[a-z0-9-]+$", data["id"]):
+                raise ValueError(f"Invalid skill id format: {data['id']}. Only lowercase letters, numbers, and hyphens are allowed.")
 
             # Set default entry path if not specified
             if "entry" not in data or not data["entry"]:

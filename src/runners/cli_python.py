@@ -16,9 +16,13 @@ from ..models import (
     SkillManifest,
     SkillMeta,
 )
+from ..security import SecurityError, ensure_within_allowed_root
 from .base import SkillRunner
 
 logger = logging.getLogger(__name__)
+
+# Maximum output size (10MB)
+MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 
 
 class CLIPythonRunner(SkillRunner):
@@ -51,7 +55,29 @@ class CLIPythonRunner(SkillRunner):
         else:
             script_path = config.get_skill_script_path(skill_id)
 
-        # Check if script exists
+        # Resolve script path
+        script_path = script_path.resolve()
+        
+        # Validate script path is within skill_cli directory (security)
+        # Note: skill_cli is different from allowed_root (data directory)
+        cli_dir_resolved = config.cli_dir.resolve()
+        try:
+            script_path.relative_to(cli_dir_resolved)
+        except ValueError:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return NormalizedSkillResult(
+                success=False,
+                skill_id=skill_id,
+                trace_id=trace_id,
+                data=None,
+                error=ErrorDetail(
+                    code=ErrorCode.FORBIDDEN_PATH,
+                    message=f"Script path is outside skill_cli directory ({cli_dir_resolved}): {script_path}",
+                ),
+                meta=SkillMeta(latency_ms=latency_ms),
+            )
+
+        # Check if script exists and is a file
         if not script_path.exists():
             latency_ms = int((time.time() - start_time) * 1000)
             return NormalizedSkillResult(
@@ -62,6 +88,20 @@ class CLIPythonRunner(SkillRunner):
                 error=ErrorDetail(
                     code=ErrorCode.NOT_FOUND,
                     message=f"Skill script not found: {script_path}",
+                ),
+                meta=SkillMeta(latency_ms=latency_ms),
+            )
+        
+        if not script_path.is_file():
+            latency_ms = int((time.time() - start_time) * 1000)
+            return NormalizedSkillResult(
+                success=False,
+                skill_id=skill_id,
+                trace_id=trace_id,
+                data=None,
+                error=ErrorDetail(
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message=f"Script path is not a file: {script_path}",
                 ),
                 meta=SkillMeta(latency_ms=latency_ms),
             )
@@ -130,11 +170,36 @@ class CLIPythonRunner(SkillRunner):
 
         latency_ms = int((time.time() - start_time) * 1000)
 
-        # Parse output
+        # Log stderr for debugging (even on success)
+        if result.stderr:
+            logger.debug(
+                f"Skill stderr output: {result.stderr[:500]}",
+                extra={"skill_id": skill_id, "trace_id": trace_id},
+            )
+
+        # Parse output with size limit
         output_text = result.stdout.strip()
         if not output_text and result.stderr:
             # Try stderr if stdout is empty
             output_text = result.stderr.strip()
+        
+        # Check output size limit
+        if len(output_text) > MAX_OUTPUT_SIZE:
+            logger.warning(
+                f"Skill output exceeds size limit ({len(output_text)} > {MAX_OUTPUT_SIZE})",
+                extra={"skill_id": skill_id, "trace_id": trace_id},
+            )
+            return NormalizedSkillResult(
+                success=False,
+                skill_id=skill_id,
+                trace_id=trace_id,
+                data=None,
+                error=ErrorDetail(
+                    code=ErrorCode.INTERNAL,
+                    message=f"Skill output too large ({len(output_text)} bytes, max {MAX_OUTPUT_SIZE} bytes)",
+                ),
+                meta=SkillMeta(latency_ms=latency_ms),
+            )
 
         if not output_text:
             return NormalizedSkillResult(

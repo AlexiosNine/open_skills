@@ -1,8 +1,11 @@
 """Configuration management for Skill Host."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Try to load .env file if python-dotenv is available
 try:
@@ -30,7 +33,15 @@ class Config:
         ).resolve()
 
         # Optional environment variables
-        self.timeout_ms: int = int(os.getenv("OPENSKILL_TIMEOUT_MS", "15000"))
+        timeout_ms_str = os.getenv("OPENSKILL_TIMEOUT_MS", "15000")
+        try:
+            self.timeout_ms: int = int(timeout_ms_str)
+            if self.timeout_ms <= 0:
+                raise ValueError("timeout_ms must be > 0")
+            if self.timeout_ms > 300000:  # 5 minutes
+                logger.warning(f"timeout_ms ({self.timeout_ms}) is very large, consider reducing it")
+        except ValueError as e:
+            raise ValueError(f"Invalid OPENSKILL_TIMEOUT_MS value: {timeout_ms_str}. {e}")
         self.debug: bool = os.getenv("OPENSKILL_DEBUG", "0") == "1"
 
         # LLM API Configuration

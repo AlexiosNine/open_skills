@@ -78,10 +78,11 @@ def ensure_within_allowed_root(path: Path) -> Path:
     """
     allowed_root = config.allowed_root.resolve()
     try:
-        path.resolve().relative_to(allowed_root)
+        resolved_path = path.resolve()
+        resolved_path.relative_to(allowed_root)
     except ValueError:
         raise SecurityError(
             f"Path is outside allowed root ({allowed_root}): {path}"
         )
-    return path
+    return resolved_path
 

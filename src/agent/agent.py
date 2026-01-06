@@ -69,10 +69,14 @@ class Agent:
 
             # Call LLM
             try:
+                remaining_tokens = request.max_tokens - total_tokens if total_tokens > 0 else request.max_tokens
+                if remaining_tokens <= 0:
+                    logger.warning(f"No tokens remaining: {total_tokens}/{request.max_tokens}")
+                    break
                 llm_response = self.llm_client.chat(
                     messages=messages,
                     tools=tools if iteration < request.max_tool_calls else None,
-                    max_tokens=request.max_tokens - total_tokens if total_tokens > 0 else request.max_tokens,
+                    max_tokens=remaining_tokens,
                     temperature=request.temperature,
                 )
             except Exception as e:

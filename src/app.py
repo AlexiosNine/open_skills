@@ -1,9 +1,9 @@
 """FastAPI Skill Host application."""
 
 import logging
+import re
 import time
 import uuid
-from contextvars import ContextVar
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -16,7 +16,7 @@ from .models import (
     SkillInvokeRequest,
 )
 from .agent.api import router as agent_router
-from .middleware import logging_middleware
+from .middleware import logging_middleware, trace_id_ctx
 from .registry import get_registry
 from .runners import get_factory
 from .utils import format_latency_ms, get_version, setup_logging
@@ -24,9 +24,6 @@ from .utils import format_latency_ms, get_version, setup_logging
 # Setup logging
 setup_logging(debug=config.debug)
 logger = logging.getLogger(__name__)
-
-# Context variable for trace_id
-trace_id_ctx: ContextVar[str] = ContextVar("trace_id", default="")
 
 # Create FastAPI app
 app = FastAPI(
@@ -99,8 +96,25 @@ async def invoke_skill(
     Returns:
         NormalizedSkillResult
     """
+    # Validate skill_id format (alphanumeric and hyphens only)
+    import re
+    if not re.match(r"^[a-z0-9-]+$", skill_id):
+        latency_ms = format_latency_ms(time.time())
+        return NormalizedSkillResult(
+            success=False,
+            skill_id=skill_id,
+            trace_id=_get_trace_id(x_trace_id),
+            data=None,
+            error=ErrorDetail(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"Invalid skill_id format: {skill_id}. Only lowercase letters, numbers, and hyphens are allowed.",
+            ),
+            meta={"latency_ms": latency_ms, "version": get_version()},
+        )
+    
     start_time = time.time()
     trace_id = _get_trace_id(x_trace_id)
+    # trace_id is already set in middleware, but ensure it's set here too for consistency
     trace_id_ctx.set(trace_id)
 
     logger.info(
@@ -109,6 +123,7 @@ async def invoke_skill(
     )
 
     # Get registry and factory
+    # Note: registry and factory are global singletons, get_registry() and get_factory() just return instances
     registry = get_registry()
     factory = get_factory()
 
@@ -157,6 +172,7 @@ async def invoke_skill(
         return result
 
     # Invoke the skill
+    result = None
     try:
         result = runner.invoke(
             skill_id=skill_id,
@@ -184,6 +200,25 @@ async def invoke_skill(
             exc_info=True,
         )
 
+    # Ensure result is not None (safety check)
+    if result is None:
+        latency_ms = format_latency_ms(start_time)
+        result = NormalizedSkillResult(
+            success=False,
+            skill_id=skill_id,
+            trace_id=trace_id,
+            data=None,
+            error=ErrorDetail(
+                code=ErrorCode.INTERNAL,
+                message="Skill invocation returned no result",
+            ),
+            meta={"latency_ms": latency_ms, "version": get_version()},
+        )
+        logger.error(
+            f"Skill invocation returned None: skill_id={skill_id}",
+            extra={"trace_id": trace_id},
+        )
+
     # Log the result
     latency_ms = result.meta.latency_ms if result.meta else 0
     logger.info(
@@ -198,18 +233,27 @@ async def invoke_skill(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    # Extract trace_id from request header if available
+    trace_id = request.headers.get("X-Trace-Id") or _get_trace_id()
+    
+    # In production, don't expose detailed exception information
+    include_details = config.debug
+    error_details = None
+    if include_details:
+        error_details = {"exception": type(exc).__name__, "reason": str(exc)}
+    
+    logger.error(f"Unhandled exception: {exc}", exc_info=True, extra={"trace_id": trace_id})
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
             "skill_id": "unknown",
-            "trace_id": _get_trace_id(),
+            "trace_id": trace_id,
             "data": None,
             "error": {
                 "code": ErrorCode.INTERNAL.value,
                 "message": "Internal server error",
-                "details": {"exception": type(exc).__name__, "reason": str(exc)},
+                "details": error_details,
             },
             "meta": {"latency_ms": 0, "version": get_version()},
         },
