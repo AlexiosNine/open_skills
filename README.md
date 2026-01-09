@@ -1,4 +1,4 @@
-# OpenSkill Skill Host - Local Demo
+# OpenSkill Skill Host 
 
 本地 Skill Host 实现，使用 FastAPI 提供统一的 HTTP 协议来调用和执行 skills。
 
